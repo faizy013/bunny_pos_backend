@@ -352,6 +352,39 @@ def _invoice_response(doc):
 
 @frappe.whitelist()
 @pos_api
+def get_receipt_html(invoice):
+	"""The receipt as ERPNext would print it, when the profile names a format.
+
+	If the POS Profile has a Print Format, that is what the customer gets --
+	letter head, terms and print heading included. With no format set this
+	returns nothing and the till falls back to its own built-in layout.
+	"""
+	if not frappe.db.exists("POS Invoice", invoice):
+		frappe.throw(_("Bunny POS: invoice {0} does not exist.").format(invoice))
+
+	pos_profile = frappe.db.get_value("POS Invoice", invoice, "pos_profile")
+	profile = get_pos_profile(pos_profile)
+
+	if not profile.print_format:
+		return {"html": None, "print_format": None}
+
+	html = frappe.get_print(
+		"POS Invoice",
+		invoice,
+		print_format=profile.print_format,
+		letterhead=profile.letter_head or None,
+		no_letterhead=0 if profile.letter_head else 1,
+	)
+
+	return {
+		"html": html,
+		"print_format": profile.print_format,
+		"letter_head": profile.letter_head or "",
+	}
+
+
+@frappe.whitelist()
+@pos_api
 def search_invoices(pos_profile=None, search_term=None, limit=20):
 	"""Recent sales that could be returned, newest first."""
 	profile = _resolve_profile(pos_profile)

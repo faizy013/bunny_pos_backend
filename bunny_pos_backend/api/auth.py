@@ -40,29 +40,6 @@ def server_info():
 
 @frappe.whitelist()
 @pos_api
-def client_version():
-	"""What version the tills on this site should be running.
-
-	Read from site_config.json, so a new build is announced by editing one
-	file on the server the tills already talk to -- no extra hosting:
-
-	    "bunny_pos_client_version": "0.2.0",
-	    "bunny_pos_download_url": "https://drive.google.com/...",
-	    "bunny_pos_update_notes": "Returns and live stock",
-	    "bunny_pos_update_mandatory": 0
-
-	Leave the version unset and tills simply never mention updates.
-	"""
-	return {
-		"version": str(frappe.conf.get("bunny_pos_client_version") or "").strip(),
-		"download_url": str(frappe.conf.get("bunny_pos_download_url") or "").strip(),
-		"notes": str(frappe.conf.get("bunny_pos_update_notes") or "").strip(),
-		"mandatory": cint(frappe.conf.get("bunny_pos_update_mandatory")),
-	}
-
-
-@frappe.whitelist()
-@pos_api
 def test_connection():
 	"""Confirm the address and stored credentials on this till still work."""
 	return {

@@ -14,7 +14,7 @@ import json
 
 import frappe
 from frappe import _
-from frappe.utils import cint
+from frappe.utils import cint, flt
 
 # Authorization schemes Frappe accepts for API Key + Secret pairs.
 # "token <key>:<secret>" is what Bunny POS sends; "basic" is the base64 variant
@@ -149,6 +149,20 @@ def profile_context(profile) -> dict:
 		"price_list": profile.selling_price_list,
 		"customer": profile.customer,
 		"allow_partial_payment": cint(profile.allow_partial_payment),
+		# Everything below is a POS Profile switch the till has to obey, so a
+		# shop configures its tills from ERPNext and nowhere else.
+		"hide_images": cint(profile.hide_images),
+		"hide_unavailable_items": cint(profile.hide_unavailable_items),
+		"auto_add_item_to_cart": cint(profile.auto_add_item_to_cart),
+		"print_receipt_on_order_complete": cint(profile.print_receipt_on_order_complete),
+		"disable_grand_total_to_default_mop": cint(profile.disable_grand_total_to_default_mop),
+		"disable_rounded_total": cint(profile.disable_rounded_total),
+		"validate_stock_on_save": cint(profile.validate_stock_on_save),
+		"write_off_limit": flt(profile.write_off_limit),
+		"print_format": profile.print_format or "",
+		"letter_head": profile.letter_head or "",
+		"terms": profile.tc_name or "",
+		"print_heading": profile.select_print_heading or "",
 		"allow_rate_change": cint(profile.allow_rate_change),
 		"allow_discount_change": cint(profile.allow_discount_change),
 		"payments": get_payment_modes(profile),
