@@ -9,6 +9,7 @@ Paged and filterable, so a site with thousands of items stays workable.
 """
 
 import frappe
+from frappe import _
 from frappe.utils import cint, flt, getdate, nowdate
 
 from bunny_pos_backend.api.utils import get_pos_profile, parse_json, pos_api, profile_context
@@ -62,6 +63,61 @@ def get_items(pos_profile, search_term=None, item_group=None, start=0, limit=Non
 	context.update({"items": items, "start": start, "limit": limit, "has_more": has_more})
 
 	return context
+
+
+@frappe.whitelist()
+@pos_api
+def scan(pos_profile, code):
+	"""Resolve a scanned barcode, serial number or batch to a sellable item.
+
+	Uses ERPNext's own ``scan_barcode``, so whatever a shop has already set up
+	on Item Barcode, Serial No or Batch works here with no extra configuration.
+	A barcode that names a UOM -- a case barcode, say -- sells in that UOM.
+	"""
+	from erpnext.stock.utils import scan_barcode
+
+	profile = get_pos_profile(pos_profile)
+
+	code = str(code or "").strip()
+	if not code:
+		frappe.throw(_("Bunny POS: nothing was scanned."))
+
+	found = scan_barcode(code) or {}
+	item_code = found.get("item_code")
+	if not item_code:
+		frappe.throw(_("Bunny POS: nothing matches {0}.").format(code))
+
+	rows = _fetch_items(profile, None, None, 0, 1, item_code=item_code)
+	if not rows:
+		frappe.throw(
+			_("Bunny POS: {0} is not sellable on this POS Profile.").format(item_code)
+		)
+
+	item = rows[0]
+	prices = _get_prices(profile, [item_code])
+	stock = _get_stock(profile, [item_code])
+	uoms = _get_uoms([item_code])
+
+	price = prices.get(item_code) or {}
+	item.rate = flt(price.get("price_list_rate"))
+	item.price_list_rate = item.rate
+	item.currency = price.get("currency") or profile.currency
+	item.stock_qty = flt(stock.get(item_code))
+	item.uom = item.stock_uom
+	item.uoms = uoms.get(item_code) or [{"uom": item.stock_uom, "conversion_factor": 1.0}]
+
+	# A barcode may be specific to a pack size; sell it in that UOM.
+	scanned_uom = found.get("uom")
+	if scanned_uom and any(u["uom"] == scanned_uom for u in item.uoms):
+		item.uom = scanned_uom
+
+	return {
+		"item": item,
+		"uom": item.uom,
+		"barcode": found.get("barcode") or "",
+		"serial_no": found.get("serial_no") or "",
+		"batch_no": found.get("batch_no") or "",
+	}
 
 
 @frappe.whitelist()
@@ -123,9 +179,13 @@ def _base_conditions(profile):
 	return conditions, params
 
 
-def _fetch_items(profile, search_term, item_group, start, limit):
+def _fetch_items(profile, search_term, item_group, start, limit, item_code=None):
 	conditions, params = _base_conditions(profile)
 	params.update({"limit": limit, "start": start})
+
+	if item_code:
+		conditions.append("i.name = %(item_code)s")
+		params["item_code"] = item_code
 
 	if item_group:
 		# One chosen category, plus anything nested under it.
