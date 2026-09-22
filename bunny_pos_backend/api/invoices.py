@@ -226,7 +226,11 @@ def _redeem_loyalty(doc, points):
 
 	doc.loyalty_program = program
 	doc.loyalty_points = points
-	doc.loyalty_amount = value
+
+	# loyalty_amount is deliberately left alone. ERPNext works out points
+	# earned from `grand_total - loyalty_amount`, and the discount below has
+	# already taken the points off grand_total -- setting it too would subtract
+	# them twice and hand the customer a negative earning.
 	doc.apply_discount_on = "Grand Total"
 	doc.discount_amount = flt(doc.discount_amount) + value
 	doc.calculate_taxes_and_totals()

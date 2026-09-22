@@ -234,6 +234,31 @@ class TestCreateInvoice(unittest.TestCase):
 		)
 		self.assertEqual(sum(taken), -spend, "the points were discounted but never taken")
 
+	def test_redeeming_never_earns_negative_points(self):
+		"""ERPNext earns on grand_total minus loyalty_amount.
+
+		The points are already off the total here, so leaving loyalty_amount
+		set made it subtract them twice and take points the customer never
+		spent.
+		"""
+		from bunny_pos_backend.api.customers import get_loyalty
+
+		customer = frappe.db.get_value("POS Profile", self.shift.pos_profile, "customer")
+		before = get_loyalty(customer, self.shift.pos_profile)
+		if not before.get("enrolled") or before["points"] < 5:
+			raise unittest.SkipTest("customer has no points to spend")
+
+		sale = create_invoice(
+			self._cart(), loyalty_points=5, request_id=frappe.generate_hash(length=20)
+		)
+		earned = frappe.get_all(
+			"Loyalty Point Entry",
+			filters={"invoice": sale["name"], "redeem_against": ("is", "not set")},
+			pluck="loyalty_points",
+		)
+		for points in earned:
+			self.assertGreaterEqual(points, 0, "a sale must never earn negative points")
+
 	def test_more_points_than_the_customer_has_is_refused(self):
 		with self.assertRaises(frappe.ValidationError):
 			create_invoice(
