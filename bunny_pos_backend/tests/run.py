@@ -21,7 +21,12 @@ import frappe
 def all(verbosity: int = 2):
 	"""Run every Bunny POS test module and return a short summary."""
 	loader = unittest.TestLoader()
-	suite = loader.loadTestsFromNames(["bunny_pos_backend.tests.test_invoices"])
+	suite = loader.loadTestsFromNames(
+		[
+			"bunny_pos_backend.tests.test_invoices",
+			"bunny_pos_backend.tests.test_restaurant",
+		]
+	)
 	result = unittest.TextTestRunner(verbosity=verbosity).run(suite)
 
 	summary = {
