@@ -42,9 +42,9 @@ def _with_note(item_name, note):
 
 
 def _table(name, profile):
-	if not frappe.db.exists("Bunny Restaurant Table", name):
+	if not frappe.db.exists("Restaurant Table", name):
 		frappe.throw(_("Bunny POS: there is no table called {0}.").format(name))
-	doc = frappe.get_doc("Bunny Restaurant Table", name)
+	doc = frappe.get_doc("Restaurant Table", name)
 	if doc.pos_profile != profile.name:
 		frappe.throw(
 			_("Bunny POS: {0} belongs to {1}, not this till.").format(name, doc.pos_profile)
@@ -73,9 +73,9 @@ def _forget_tickets(order_name):
 	leaving them behind lets a later order inherit the wrong history.
 	"""
 	for name in frappe.get_all(
-		"Bunny Kitchen Ticket", filters={"sales_order": order_name}, pluck="name"
+		"Kitchen Ticket", filters={"sales_order": order_name}, pluck="name"
 	):
-		frappe.delete_doc("Bunny Kitchen Ticket", name, ignore_permissions=True, force=True)
+		frappe.delete_doc("Kitchen Ticket", name, ignore_permissions=True, force=True)
 
 
 def _order_summary(doc):
@@ -113,7 +113,7 @@ def get_tables(pos_profile=None):
 	profile = get_pos_profile(pos_profile)
 
 	tables = frappe.get_all(
-		"Bunny Restaurant Table",
+		"Restaurant Table",
 		filters={"pos_profile": profile.name, "disabled": 0},
 		fields=["name", "table_name", "section", "seats"],
 		order_by="section asc, table_name asc",
@@ -299,12 +299,12 @@ def _sent_so_far(order_name):
 	"""How much of each item+note the kitchen has already been given."""
 	sent = {}
 	tickets = frappe.get_all(
-		"Bunny Kitchen Ticket", filters={"sales_order": order_name}, pluck="name"
+		"Kitchen Ticket", filters={"sales_order": order_name}, pluck="name"
 	)
 	if not tickets:
 		return sent
 	for row in frappe.get_all(
-		"Bunny Kitchen Ticket Item",
+		"Kitchen Ticket Item",
 		filters={"parent": ("in", tickets)},
 		fields=["item_code", "notes", "qty"],
 	):
@@ -430,7 +430,7 @@ def mark_sent(table, items=None, pos_profile=None):
 	if not rows:
 		return {"recorded": 0}
 
-	ticket = frappe.new_doc("Bunny Kitchen Ticket")
+	ticket = frappe.new_doc("Kitchen Ticket")
 	ticket.restaurant_table = table
 	ticket.sales_order = name
 	ticket.pos_profile = profile.name
@@ -478,7 +478,7 @@ def move_table(table, to_table, pos_profile=None):
 		source.save()
 		# The tickets follow the food.
 		frappe.db.set_value(
-			"Bunny Kitchen Ticket", {"sales_order": source_name}, "restaurant_table", to_table
+			"Kitchen Ticket", {"sales_order": source_name}, "restaurant_table", to_table
 		)
 		return {"moved": True, "merged": False, "order": source_name, "table": to_table}
 
@@ -502,10 +502,10 @@ def move_table(table, to_table, pos_profile=None):
 	target.save()
 
 	frappe.db.set_value(
-		"Bunny Kitchen Ticket", {"sales_order": source_name}, "sales_order", target_name
+		"Kitchen Ticket", {"sales_order": source_name}, "sales_order", target_name
 	)
 	frappe.db.set_value(
-		"Bunny Kitchen Ticket", {"sales_order": target_name}, "restaurant_table", to_table
+		"Kitchen Ticket", {"sales_order": target_name}, "restaurant_table", to_table
 	)
 	frappe.delete_doc("Sales Order", source_name, ignore_permissions=True, force=True)
 

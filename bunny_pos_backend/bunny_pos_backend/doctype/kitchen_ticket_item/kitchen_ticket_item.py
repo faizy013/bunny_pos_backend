@@ -4,5 +4,5 @@
 from frappe.model.document import Document
 
 
-class BunnyKitchenTicketItem(Document):
+class KitchenTicketItem(Document):
 	pass

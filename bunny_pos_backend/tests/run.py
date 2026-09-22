@@ -40,3 +40,4 @@ def all(verbosity: int = 2):
 	# These tests bill real invoices, so leave the site consistent either way.
 	frappe.db.commit()
 	return summary
+

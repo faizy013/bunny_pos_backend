@@ -6,7 +6,7 @@ from frappe import _
 from frappe.model.document import Document
 
 
-class BunnyRestaurantTable(Document):
+class RestaurantTable(Document):
 	def validate(self):
 		self.table_name = (self.table_name or "").strip()
 		if not self.table_name:

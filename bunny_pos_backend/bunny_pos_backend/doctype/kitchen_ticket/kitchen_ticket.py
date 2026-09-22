@@ -4,7 +4,7 @@
 from frappe.model.document import Document
 
 
-class BunnyKitchenTicket(Document):
+class KitchenTicket(Document):
 	"""A record of what the kitchen has already been told to cook.
 
 	Kept so a second trip to the pass sends only what is new. Without it the

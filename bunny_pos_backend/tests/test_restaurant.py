@@ -52,10 +52,10 @@ class TestRestaurant(unittest.TestCase):
 
 		# A table of our own, so a real floor plan is never disturbed.
 		cls.table = "ZZ-TEST-TABLE"
-		if not frappe.db.exists("Bunny Restaurant Table", cls.table):
+		if not frappe.db.exists("Restaurant Table", cls.table):
 			frappe.get_doc(
 				{
-					"doctype": "Bunny Restaurant Table",
+					"doctype": "Restaurant Table",
 					"table_name": cls.table,
 					"pos_profile": cls.shift.pos_profile,
 					"section": "Testing",
@@ -71,7 +71,7 @@ class TestRestaurant(unittest.TestCase):
 				clear_table(cls.table, pos_profile=cls.shift.pos_profile)
 			except Exception:
 				pass
-			frappe.delete_doc("Bunny Restaurant Table", cls.table, ignore_permissions=True, force=True)
+			frappe.delete_doc("Restaurant Table", cls.table, ignore_permissions=True, force=True)
 			frappe.db.commit()
 		if getattr(cls, "previous_user", None):
 			frappe.set_user(cls.previous_user)
@@ -203,10 +203,10 @@ class TestRestaurant(unittest.TestCase):
 
 	def test_a_party_moves_to_a_free_table(self):
 		other = "ZZ-TEST-TABLE-2"
-		if not frappe.db.exists("Bunny Restaurant Table", other):
+		if not frappe.db.exists("Restaurant Table", other):
 			frappe.get_doc(
 				{
-					"doctype": "Bunny Restaurant Table",
+					"doctype": "Restaurant Table",
 					"table_name": other,
 					"pos_profile": self.shift.pos_profile,
 					"section": "Testing",
@@ -223,14 +223,14 @@ class TestRestaurant(unittest.TestCase):
 			)
 		finally:
 			clear_table(other, pos_profile=self.shift.pos_profile)
-			frappe.delete_doc("Bunny Restaurant Table", other, ignore_permissions=True, force=True)
+			frappe.delete_doc("Restaurant Table", other, ignore_permissions=True, force=True)
 
 	def test_moving_onto_a_seated_table_joins_the_orders(self):
 		other = "ZZ-TEST-TABLE-3"
-		if not frappe.db.exists("Bunny Restaurant Table", other):
+		if not frappe.db.exists("Restaurant Table", other):
 			frappe.get_doc(
 				{
-					"doctype": "Bunny Restaurant Table",
+					"doctype": "Restaurant Table",
 					"table_name": other,
 					"pos_profile": self.shift.pos_profile,
 					"section": "Testing",
@@ -249,7 +249,7 @@ class TestRestaurant(unittest.TestCase):
 			self.assertEqual(sum(row["qty"] for row in joined["items"]), 5)
 		finally:
 			clear_table(other, pos_profile=self.shift.pos_profile)
-			frappe.delete_doc("Bunny Restaurant Table", other, ignore_permissions=True, force=True)
+			frappe.delete_doc("Restaurant Table", other, ignore_permissions=True, force=True)
 
 	def test_a_table_cannot_move_onto_itself(self):
 		save_order(self.table, self._cart(), pos_profile=self.shift.pos_profile)
