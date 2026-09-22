@@ -14,6 +14,8 @@ from bunny_pos_backend.api.restaurant import (
 	get_kitchen_ticket,
 	get_order,
 	get_tables,
+	mark_sent,
+	move_table,
 	save_order,
 )
 
@@ -152,6 +154,107 @@ class TestRestaurant(unittest.TestCase):
 			1,
 		)
 		self.assertTrue(first["name"])
+
+	def test_a_note_rides_along_to_the_kitchen(self):
+		"""A ticket without "no onions" on it is not much use to a cook."""
+		save_order(
+			self.table,
+			[{"item_code": self.item["item_code"], "qty": 1, "notes": "no onions"}],
+			pos_profile=self.shift.pos_profile,
+		)
+		order = get_order(self.table, pos_profile=self.shift.pos_profile)
+		self.assertEqual(order["items"][0]["notes"], "no onions")
+
+		ticket = get_kitchen_ticket(self.table, pos_profile=self.shift.pos_profile)
+		self.assertEqual(ticket["items"][0]["notes"], "no onions")
+		self.assertIn("no onions", ticket["html"])
+
+	def test_the_kitchen_is_only_told_what_is_new(self):
+		"""Sending the whole table again leaves the cook guessing."""
+		save_order(self.table, self._cart(2), pos_profile=self.shift.pos_profile)
+
+		first = get_kitchen_ticket(self.table, pos_profile=self.shift.pos_profile)
+		self.assertEqual(first["items"][0]["qty"], 2)
+		mark_sent(self.table, first["items"], pos_profile=self.shift.pos_profile)
+
+		with self.assertRaises(frappe.ValidationError):
+			get_kitchen_ticket(self.table, pos_profile=self.shift.pos_profile)
+
+		# A second course: only that goes.
+		save_order(self.table, self._cart(5), pos_profile=self.shift.pos_profile)
+		second = get_kitchen_ticket(self.table, pos_profile=self.shift.pos_profile)
+		self.assertEqual(second["items"][0]["qty"], 3)
+
+	def test_a_reprint_sends_the_whole_ticket(self):
+		save_order(self.table, self._cart(2), pos_profile=self.shift.pos_profile)
+		ticket = get_kitchen_ticket(self.table, pos_profile=self.shift.pos_profile)
+		mark_sent(self.table, ticket["items"], pos_profile=self.shift.pos_profile)
+
+		again = get_kitchen_ticket(self.table, pos_profile=self.shift.pos_profile, everything=1)
+		self.assertTrue(again["repeat"])
+		self.assertEqual(again["items"][0]["qty"], 2)
+
+	def test_a_reprint_does_not_count_as_sending(self):
+		"""Otherwise a lost ticket reprinted would hide the next course."""
+		save_order(self.table, self._cart(2), pos_profile=self.shift.pos_profile)
+		get_kitchen_ticket(self.table, pos_profile=self.shift.pos_profile, everything=1)
+		pending = get_kitchen_ticket(self.table, pos_profile=self.shift.pos_profile)
+		self.assertEqual(pending["items"][0]["qty"], 2)
+
+	def test_a_party_moves_to_a_free_table(self):
+		other = "ZZ-TEST-TABLE-2"
+		if not frappe.db.exists("Bunny Restaurant Table", other):
+			frappe.get_doc(
+				{
+					"doctype": "Bunny Restaurant Table",
+					"table_name": other,
+					"pos_profile": self.shift.pos_profile,
+					"section": "Testing",
+					"seats": 2,
+				}
+			).insert(ignore_permissions=True)
+		try:
+			save_order(self.table, self._cart(2), pos_profile=self.shift.pos_profile)
+			result = move_table(self.table, other, pos_profile=self.shift.pos_profile)
+			self.assertFalse(result["merged"])
+			self.assertIsNone(get_order(self.table, pos_profile=self.shift.pos_profile))
+			self.assertEqual(
+				get_order(other, pos_profile=self.shift.pos_profile)["items"][0]["qty"], 2
+			)
+		finally:
+			clear_table(other, pos_profile=self.shift.pos_profile)
+			frappe.delete_doc("Bunny Restaurant Table", other, ignore_permissions=True, force=True)
+
+	def test_moving_onto_a_seated_table_joins_the_orders(self):
+		other = "ZZ-TEST-TABLE-3"
+		if not frappe.db.exists("Bunny Restaurant Table", other):
+			frappe.get_doc(
+				{
+					"doctype": "Bunny Restaurant Table",
+					"table_name": other,
+					"pos_profile": self.shift.pos_profile,
+					"section": "Testing",
+					"seats": 4,
+				}
+			).insert(ignore_permissions=True)
+		try:
+			save_order(self.table, self._cart(2), pos_profile=self.shift.pos_profile)
+			save_order(other, self._cart(3), pos_profile=self.shift.pos_profile)
+
+			result = move_table(self.table, other, pos_profile=self.shift.pos_profile)
+			self.assertTrue(result["merged"])
+			self.assertIsNone(get_order(self.table, pos_profile=self.shift.pos_profile))
+
+			joined = get_order(other, pos_profile=self.shift.pos_profile)
+			self.assertEqual(sum(row["qty"] for row in joined["items"]), 5)
+		finally:
+			clear_table(other, pos_profile=self.shift.pos_profile)
+			frappe.delete_doc("Bunny Restaurant Table", other, ignore_permissions=True, force=True)
+
+	def test_a_table_cannot_move_onto_itself(self):
+		save_order(self.table, self._cart(), pos_profile=self.shift.pos_profile)
+		with self.assertRaises(frappe.ValidationError):
+			move_table(self.table, self.table, pos_profile=self.shift.pos_profile)
 
 	def test_an_unknown_table_is_refused(self):
 		with self.assertRaises(frappe.ValidationError):

@@ -20,6 +20,27 @@ from bunny_pos_backend.api.invoices import create_invoice
 from bunny_pos_backend.api.utils import get_pos_profile, parse_json, pos_api
 
 
+NOTE_TAG = "\u2014 "
+
+
+def _split_note(description, item_name):
+	"""Pull the cashier's note back out of the line's description."""
+	text = (description or "").strip()
+	if NOTE_TAG not in text:
+		return ""
+	return text.split(NOTE_TAG, 1)[1].strip()
+
+
+def _with_note(item_name, note):
+	"""Notes ride on ``description``, a standard Sales Order Item field.
+
+	A kitchen ticket without "no onions" on it is not much use, and there is
+	nowhere else to put one without changing the customer's ERPNext.
+	"""
+	note = (note or "").strip()
+	return f"{item_name}\n{NOTE_TAG}{note}" if note else item_name
+
+
 def _table(name, profile):
 	if not frappe.db.exists("Bunny Restaurant Table", name):
 		frappe.throw(_("Bunny POS: there is no table called {0}.").format(name))
@@ -44,6 +65,19 @@ def _open_order_name(table, company):
 	return rows[0].name if rows else None
 
 
+def _forget_tickets(order_name):
+	"""Drop the kitchen history when its order goes.
+
+	The tickets exist to tell one open order's new courses from its old ones.
+	Once the order is gone they answer a question nobody will ask again, and
+	leaving them behind lets a later order inherit the wrong history.
+	"""
+	for name in frappe.get_all(
+		"Bunny Kitchen Ticket", filters={"sales_order": order_name}, pluck="name"
+	):
+		frappe.delete_doc("Bunny Kitchen Ticket", name, ignore_permissions=True, force=True)
+
+
 def _order_summary(doc):
 	return {
 		"order": doc.name,
@@ -65,6 +99,7 @@ def _order_summary(doc):
 				"uom": row.uom,
 				"rate": flt(row.rate),
 				"amount": flt(row.amount),
+				"notes": _split_note(row.description, row.item_name),
 			}
 			for row in doc.items
 		],
@@ -150,6 +185,7 @@ def save_order(table, cart_data, customer=None, pos_profile=None):
 	if not cart:
 		# An order emptied to nothing is a table nobody sat at after all.
 		if name:
+			_forget_tickets(name)
 			frappe.delete_doc("Sales Order", name, ignore_permissions=True, force=True)
 		return None
 
@@ -184,6 +220,11 @@ def save_order(table, cart_data, customer=None, pos_profile=None):
 		if row.get("uom"):
 			line["uom"] = row["uom"]
 			line["conversion_factor"] = flt(row.get("conversion_factor")) or 1
+		note = str(row.get("notes") or "").strip()
+		if note:
+			line["description"] = _with_note(
+				frappe.db.get_value("Item", item_code, "item_name") or item_code, note
+			)
 		doc.append("items", line)
 
 	doc.set_missing_values()
@@ -203,6 +244,7 @@ def clear_table(table, pos_profile=None):
 	if not name:
 		return {"cleared": False}
 
+	_forget_tickets(name)
 	frappe.delete_doc("Sales Order", name, ignore_permissions=True, force=True)
 	return {"cleared": True}
 
@@ -247,15 +289,91 @@ def bill_table(table, payments=None, request_id=None, pos_profile=None, coupon_c
 		loyalty_points=loyalty_points,
 	)
 
+	_forget_tickets(name)
 	frappe.delete_doc("Sales Order", name, ignore_permissions=True, force=True)
 	invoice["table"] = table
 	return invoice
 
 
+def _sent_so_far(order_name):
+	"""How much of each item+note the kitchen has already been given."""
+	sent = {}
+	tickets = frappe.get_all(
+		"Bunny Kitchen Ticket", filters={"sales_order": order_name}, pluck="name"
+	)
+	if not tickets:
+		return sent
+	for row in frappe.get_all(
+		"Bunny Kitchen Ticket Item",
+		filters={"parent": ("in", tickets)},
+		fields=["item_code", "notes", "qty"],
+	):
+		key = (row.item_code, (row.notes or "").strip())
+		sent[key] = sent.get(key, 0) + flt(row.qty)
+	return sent
+
+
+def _pending_for_kitchen(order):
+	"""What the cook has not been told about yet, in order."""
+	sent = _sent_so_far(order.name)
+	pending = []
+	for row in order.items:
+		note = _split_note(row.description, row.item_name)
+		key = (row.item_code, note)
+		already = sent.get(key, 0)
+		outstanding = flt(row.qty) - already
+		if outstanding <= 0:
+			# Fully sent; anything left over counts against later lines.
+			sent[key] = already - flt(row.qty)
+			continue
+		sent[key] = 0
+		pending.append(
+			{"item_code": row.item_code, "item_name": row.item_name, "qty": outstanding, "notes": note}
+		)
+	return pending
+
+
+def _kitchen_html(table, profile, rows, repeat=False):
+	body = "".join(
+		"<tr><td class='q'>{qty:g}</td><td>{name}{note}</td></tr>".format(
+			qty=flt(row["qty"]),
+			name=frappe.utils.escape_html(row["item_name"]),
+			note=(
+				f"<div class='note'>{frappe.utils.escape_html(row['notes'])}</div>"
+				if row.get("notes")
+				else ""
+			),
+		)
+		for row in rows
+	)
+	mark = "<div class='again'>REPRINT</div>" if repeat else ""
+	return f"""<!doctype html><meta charset="utf-8">
+<style>
+  body {{ font-family: "Courier New", monospace; width: 72mm; margin: 0; padding: 6mm 4mm; color: #000; }}
+  h1 {{ font-size: 22px; margin: 0 0 1mm; letter-spacing: .04em; }}
+  .meta {{ font-size: 12px; margin-bottom: 3mm; }}
+  .again {{ font-size: 13px; font-weight: 700; border: 2px solid #000; display: inline-block;
+            padding: 0 2mm; margin-bottom: 2mm; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 15px; }}
+  td {{ padding: 2mm 0; border-bottom: 1px dashed #999; vertical-align: top; }}
+  td.q {{ width: 12mm; font-weight: 700; }}
+  .note {{ font-size: 12px; font-weight: 700; text-transform: uppercase; padding-top: .5mm; }}
+</style>
+<h1>TABLE {frappe.utils.escape_html(table)}</h1>
+{mark}
+<div class="meta">{frappe.utils.format_datetime(frappe.utils.now(), "dd MMM, HH:mm")} &middot; {frappe.utils.escape_html(profile.name)}</div>
+<table>{body}</table>"""
+
+
 @frappe.whitelist()
 @pos_api
-def get_kitchen_ticket(table, pos_profile=None):
-	"""A plain list of what to cook, for the kitchen printer."""
+def get_kitchen_ticket(table, pos_profile=None, everything=0):
+	"""What the kitchen has not been told yet.
+
+	Only the new courses go, because sending the whole table again leaves the
+	cook guessing which dishes they have already made. ``everything`` reprints
+	the lot, for when a ticket is lost.
+	"""
 	profile = get_pos_profile(pos_profile)
 	_table(table, profile)
 
@@ -264,21 +382,131 @@ def get_kitchen_ticket(table, pos_profile=None):
 		frappe.throw(_("Bunny POS: {0} has no order to send.").format(table))
 
 	order = frappe.get_doc("Sales Order", name)
-	rows = "".join(
-		f"<tr><td class='q'>{flt(row.qty):g}</td><td>{frappe.utils.escape_html(row.item_name)}</td></tr>"
-		for row in order.items
-	)
-	html = f"""<!doctype html><meta charset="utf-8">
-<style>
-  body {{ font-family: "Courier New", monospace; width: 72mm; margin: 0; padding: 6mm 4mm; color: #000; }}
-  h1 {{ font-size: 20px; margin: 0 0 2mm; letter-spacing: .04em; }}
-  .meta {{ font-size: 12px; margin-bottom: 3mm; }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 15px; }}
-  td {{ padding: 1.5mm 0; border-bottom: 1px dashed #999; vertical-align: top; }}
-  td.q {{ width: 12mm; font-weight: 700; }}
-</style>
-<h1>TABLE {frappe.utils.escape_html(table)}</h1>
-<div class="meta">{frappe.utils.format_datetime(frappe.utils.now(), "dd MMM, HH:mm")} &middot; {frappe.utils.escape_html(profile.name)}</div>
-<table>{rows}</table>"""
+	repeat = bool(cint(everything))
 
-	return {"table": table, "order": name, "html": html}
+	if repeat:
+		rows = [
+			{
+				"item_code": row.item_code,
+				"item_name": row.item_name,
+				"qty": flt(row.qty),
+				"notes": _split_note(row.description, row.item_name),
+			}
+			for row in order.items
+		]
+	else:
+		rows = _pending_for_kitchen(order)
+
+	if not rows:
+		frappe.throw(_("Bunny POS: the kitchen already has everything on {0}.").format(table))
+
+	return {
+		"table": table,
+		"order": name,
+		"repeat": repeat,
+		"items": rows,
+		"html": _kitchen_html(table, profile, rows, repeat),
+	}
+
+
+@frappe.whitelist(methods=["POST"])
+@pos_api
+def mark_sent(table, items=None, pos_profile=None):
+	"""Record what the kitchen was just given, so it is not sent twice.
+
+	Kept apart from building the ticket: nothing counts as sent until the till
+	says the printer took it.
+	"""
+	profile = get_pos_profile(pos_profile)
+	_table(table, profile)
+
+	name = _open_order_name(table, profile.company)
+	if not name:
+		frappe.throw(_("Bunny POS: {0} has no order.").format(table))
+
+	rows = parse_json(items, "items", (list,)) if items else _pending_for_kitchen(
+		frappe.get_doc("Sales Order", name)
+	)
+	if not rows:
+		return {"recorded": 0}
+
+	ticket = frappe.new_doc("Bunny Kitchen Ticket")
+	ticket.restaurant_table = table
+	ticket.sales_order = name
+	ticket.pos_profile = profile.name
+	ticket.printed_at = frappe.utils.now()
+	for row in rows:
+		ticket.append(
+			"items",
+			{
+				"item_code": row.get("item_code"),
+				"item_name": row.get("item_name"),
+				"qty": flt(row.get("qty")),
+				"notes": (row.get("notes") or "").strip(),
+			},
+		)
+	ticket.flags.ignore_permissions = True
+	ticket.insert()
+	return {"recorded": len(ticket.items), "ticket": ticket.name}
+
+
+@frappe.whitelist(methods=["POST"])
+@pos_api
+def move_table(table, to_table, pos_profile=None):
+	"""Move a party to another table, or join them to one already sitting there.
+
+	Parties move and tables get pushed together; without this the only way is
+	to retype the order, which is how courses go missing.
+	"""
+	profile = get_pos_profile(pos_profile)
+	_table(table, profile)
+	_table(to_table, profile)
+
+	if table == to_table:
+		frappe.throw(_("Bunny POS: that is the same table."))
+
+	source_name = _open_order_name(table, profile.company)
+	if not source_name:
+		frappe.throw(_("Bunny POS: {0} has nothing to move.").format(table))
+
+	target_name = _open_order_name(to_table, profile.company)
+	source = frappe.get_doc("Sales Order", source_name)
+
+	if not target_name:
+		source.po_no = to_table
+		source.flags.ignore_permissions = True
+		source.save()
+		# The tickets follow the food.
+		frappe.db.set_value(
+			"Bunny Kitchen Ticket", {"sales_order": source_name}, "restaurant_table", to_table
+		)
+		return {"moved": True, "merged": False, "order": source_name, "table": to_table}
+
+	# Both tables are occupied, so the orders join into the one already there.
+	target = frappe.get_doc("Sales Order", target_name)
+	for row in source.items:
+		target.append(
+			"items",
+			{
+				"item_code": row.item_code,
+				"qty": row.qty,
+				"uom": row.uom,
+				"conversion_factor": row.conversion_factor,
+				"rate": row.rate,
+				"description": row.description,
+				"warehouse": row.warehouse,
+				"delivery_date": row.delivery_date or target.delivery_date,
+			},
+		)
+	target.flags.ignore_permissions = True
+	target.save()
+
+	frappe.db.set_value(
+		"Bunny Kitchen Ticket", {"sales_order": source_name}, "sales_order", target_name
+	)
+	frappe.db.set_value(
+		"Bunny Kitchen Ticket", {"sales_order": target_name}, "restaurant_table", to_table
+	)
+	frappe.delete_doc("Sales Order", source_name, ignore_permissions=True, force=True)
+
+	return {"moved": True, "merged": True, "order": target_name, "table": to_table}
