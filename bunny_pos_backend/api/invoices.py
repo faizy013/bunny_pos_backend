@@ -17,7 +17,15 @@ from bunny_pos_backend.api.utils import get_pos_profile, parse_json, pos_api
 
 @frappe.whitelist(methods=["POST"])
 @pos_api
-def create_invoice(cart_data, customer=None, payments=None, pos_profile=None, request_id=None):
+def create_invoice(
+	cart_data,
+	customer=None,
+	payments=None,
+	pos_profile=None,
+	request_id=None,
+	coupon_code=None,
+	loyalty_points=None,
+):
 	"""Create and submit a POS Invoice for the caller's open shift.
 
 	``cart_data`` is a list of ``{"item_code": ..., "qty": ...}`` rows. A row may
@@ -27,6 +35,10 @@ def create_invoice(cart_data, customer=None, payments=None, pos_profile=None, re
 	``payments`` may be omitted (the whole invoice goes to the profile's default
 	mode of payment), a mapping of mode to amount, or a list of
 	``{"mode_of_payment": ..., "amount": ...}`` rows.
+
+	``coupon_code`` is the code printed on the voucher; the matching pricing
+	rule is applied by ERPNext. ``loyalty_points`` redeems that many of the
+	customer's points against this sale.
 
 	``request_id`` makes the call idempotent. A till that loses the reply to a
 	successful sale will retry it, and without this that retry bills the
@@ -46,7 +58,9 @@ def create_invoice(cart_data, customer=None, payments=None, pos_profile=None, re
 		_claim_request(request_id)
 
 	try:
-		doc = _build_and_submit(cart, customer, pos_profile, payments, request_id)
+		doc = _build_and_submit(
+			cart, customer, pos_profile, payments, request_id, coupon_code, loyalty_points
+		)
 	except Exception:
 		# The sale did not happen, so the till must be free to try again with
 		# the same id rather than being told its own retry is a duplicate.
@@ -57,7 +71,14 @@ def create_invoice(cart_data, customer=None, payments=None, pos_profile=None, re
 	return _invoice_response(doc)
 
 
-def _build_and_submit(cart, customer, pos_profile, payments, request_id):
+def _price_cart(cart, customer, pos_profile, coupon_code=None, loyalty_points=None):
+	"""Build and price a POS Invoice without saving it.
+
+	Shared by the sale itself and by the preview the till shows once a coupon
+	or some points have been entered -- the cashier has to be able to read the
+	new total out to the customer before taking the money, and only the server
+	knows what a pricing rule did.
+	"""
 	profile = _resolve_profile(pos_profile)
 
 	customer = customer or profile.customer
@@ -83,11 +104,35 @@ def _build_and_submit(cart, customer, pos_profile, payments, request_id):
 			{k: v for k, v in row.items() if not k.startswith("_")},
 		)
 
+	# The coupon has to be on the document before pricing, because it decides
+	# what the items cost.
+	_apply_coupon(doc, coupon_code, customer)
+
 	# Pull price list, warehouse, taxes and payment modes off the POS Profile,
 	# then price the cart, so the payable amount is known before it is paid.
 	doc.set_missing_values()
 	_apply_line_overrides(doc, rows, profile)
+
+	# ERPNext only applies a transaction-level pricing rule -- which is what a
+	# coupon is -- during validate. The preview never gets that far, so it is
+	# asked for here and the totals below are the ones the customer will pay.
+	if not cint(doc.get("ignore_pricing_rule")):
+		from erpnext.accounts.doctype.pricing_rule.utils import apply_pricing_rule_on_transaction
+
+		apply_pricing_rule_on_transaction(doc)
+
 	doc.calculate_taxes_and_totals()
+
+	# Only now is there a total for the points to be measured against.
+	redeemed = _redeem_loyalty(doc, loyalty_points)
+
+	return doc, profile, redeemed
+
+
+def _build_and_submit(
+	cart, customer, pos_profile, payments, request_id, coupon_code=None, loyalty_points=None
+):
+	doc, profile, redeemed = _price_cart(cart, customer, pos_profile, coupon_code, loyalty_points)
 
 	requested = _parse_payments(payments)
 	_apply_payments(doc, profile, requested)
@@ -97,7 +142,7 @@ def _build_and_submit(cart, customer, pos_profile, payments, request_id):
 	# validate() reprices the invoice; make sure a full auto-payment still
 	# covers the final total before submitting.
 	if not requested:
-		total = flt(doc.rounded_total) or flt(doc.grand_total)
+		total = _amount_due(doc)
 		if flt(doc.paid_amount, doc.precision("paid_amount")) != flt(
 			total, doc.precision("paid_amount")
 		):
@@ -106,10 +151,102 @@ def _build_and_submit(cart, customer, pos_profile, payments, request_id):
 
 	doc.submit()
 
+	if redeemed:
+		_take_loyalty_points(doc)
+
 	if request_id:
 		_mark_settled(doc, request_id)
 
 	return doc
+
+
+def _apply_coupon(doc, code, customer):
+	"""Attach a coupon so ERPNext's pricing rules discount the sale."""
+	code = str(code or "").strip()
+	if not code:
+		return
+
+	doc.coupon_code = _resolve_coupon(code, customer)["name"]
+
+
+def _redeem_loyalty(doc, points):
+	"""Take points off the bill as a discount, and return how many were used.
+
+	ERPNext's own redemption flag cannot be used on a POS Invoice: the
+	full-payment check measures the tendered rows against the whole total and
+	never subtracts what points covered, so the sale refuses to submit. Taking
+	the value off as a discount instead leaves a bill the customer really does
+	pay in full, and reads plainly on the receipt. The points themselves are
+	still removed through ERPNext, once the invoice exists to charge them
+	against.
+	"""
+	from erpnext.accounts.doctype.loyalty_program.loyalty_program import (
+		get_loyalty_program_details_with_points,
+	)
+
+	points = cint(points)
+	if points <= 0:
+		return 0
+
+	# One offer per sale. A coupon is a transaction pricing rule, and ERPNext
+	# rebuilds its discount from a percentage on every validate -- which quietly
+	# drops anything added alongside it while the points are still taken off the
+	# customer. Refusing the combination is the only way to be sure that cannot
+	# happen; stacking them would have to be settled in ERPNext, not here.
+	if doc.get("coupon_code"):
+		frappe.throw(
+			_("Bunny POS: a coupon and loyalty points cannot be used on the same sale.")
+		)
+
+	program = frappe.db.get_value("Customer", doc.customer, "loyalty_program")
+	if not program:
+		frappe.throw(
+			_("Bunny POS: {0} is not on a loyalty programme.").format(doc.customer_name or doc.customer)
+		)
+
+	details = (
+		get_loyalty_program_details_with_points(
+			doc.customer, company=doc.company, loyalty_program=program, silent=True
+		)
+		or {}
+	)
+
+	available = cint(details.get("loyalty_points"))
+	if points > available:
+		frappe.throw(
+			_("Bunny POS: only {0} points are available, not {1}.").format(available, points)
+		)
+
+	value = flt(points * flt(details.get("conversion_factor")), doc.precision("grand_total"))
+	total = flt(doc.rounded_total) or flt(doc.grand_total)
+	if value > total:
+		frappe.throw(
+			_("Bunny POS: those points are worth more than the sale. Redeem fewer.")
+		)
+
+	doc.loyalty_program = program
+	doc.loyalty_points = points
+	doc.loyalty_amount = value
+	doc.apply_discount_on = "Grand Total"
+	doc.discount_amount = flt(doc.discount_amount) + value
+	doc.calculate_taxes_and_totals()
+	return points
+
+
+def _amount_due(doc):
+	"""What has to be tendered. Points already came off as a discount."""
+	return flt(doc.rounded_total) or flt(doc.grand_total)
+
+
+def _take_loyalty_points(doc):
+	"""Charge the redeemed points to the customer's balance.
+
+	Runs after submit because ERPNext writes the entries against the invoice,
+	which has to exist first.
+	"""
+	if not cint(doc.get("loyalty_points")):
+		return
+	doc.apply_loyalty_points()
 
 
 REQUEST_PREFIX = "bunny-pos:request:"
@@ -356,8 +493,15 @@ def _parse_payments(payments):
 
 
 def _apply_payments(doc, profile, requested):
-	"""Write payment amounts onto the rows set up from the POS Profile."""
-	total = flt(doc.rounded_total) or flt(doc.grand_total)
+	"""Write payment amounts onto the rows set up from the POS Profile.
+
+	The rows carry what the customer actually hands over. ``paid_amount`` has
+	to carry that plus anything points covered, because ERPNext only folds the
+	redeemed amount into paid_amount for a Sales Invoice -- a POS Invoice keeps
+	whatever we set, and its full-payment check measures it against the whole
+	total.
+	"""
+	total = _amount_due(doc)
 	precision = doc.precision("paid_amount")
 
 	if not doc.get("payments"):
@@ -807,3 +951,88 @@ def _apply_refund(doc, profile, payments):
 		)
 
 	doc.paid_amount = flt(refunded, precision)
+
+
+@frappe.whitelist()
+@pos_api
+def check_coupon(code, customer=None, pos_profile=None):
+	"""Look a typed coupon up and say plainly whether it can be used.
+
+	The cashier types the code printed on the voucher, which is not the
+	document's name, so it is resolved here. ERPNext's own validation decides
+	whether it is in date and has uses left; this only turns its complaint into
+	something readable at a till.
+	"""
+	profile = get_pos_profile(pos_profile)
+	found = _resolve_coupon(code, customer)
+	found["currency"] = profile.currency
+	return found
+
+
+def _resolve_coupon(code, customer=None):
+	"""Turn a typed code into a usable Coupon Code, or say why it is not.
+
+	Kept apart from the endpoint because the sale itself needs this too, and
+	the sale already knows its POS Profile.
+	"""
+	from erpnext.accounts.doctype.pricing_rule.utils import validate_coupon_code
+
+	code = str(code or "").strip()
+	if not code:
+		frappe.throw(_("Bunny POS: no coupon code was entered."))
+
+	name = frappe.db.get_value("Coupon Code", {"coupon_code": code}, "name") or (
+		frappe.db.get_value("Coupon Code", {"name": code}, "name")
+	)
+	if not name:
+		frappe.throw(_("Bunny POS: {0} is not a coupon we know.").format(code))
+
+	coupon = frappe.get_doc("Coupon Code", name)
+
+	# A coupon issued to one customer is not a coupon for anyone who finds it.
+	if coupon.customer and customer and coupon.customer != customer:
+		frappe.throw(_("Bunny POS: this coupon belongs to another customer."))
+
+	try:
+		validate_coupon_code(name)
+	except Exception as err:
+		frappe.throw(_("Bunny POS: {0}").format(str(err) or _("this coupon cannot be used.")))
+
+	return {
+		"name": coupon.name,
+		"code": coupon.coupon_code,
+		"title": coupon.coupon_name,
+		"type": coupon.coupon_type,
+		"pricing_rule": coupon.pricing_rule,
+		"valid_upto": coupon.valid_upto,
+		"uses_left": (cint(coupon.maximum_use) - cint(coupon.used)) if coupon.maximum_use else None,
+	}
+
+
+@frappe.whitelist()
+@pos_api
+def quote(cart_data, customer=None, pos_profile=None, coupon_code=None, loyalty_points=None):
+	"""Price a cart without selling it.
+
+	A coupon's discount comes out of a pricing rule, which only the server can
+	work out, so the till cannot show the customer what they owe until it asks.
+	Nothing here is saved.
+	"""
+	cart = parse_json(cart_data, "cart_data", (list,))
+	if not cart:
+		frappe.throw(_("Bunny POS: the cart is empty."))
+
+	doc, profile, redeemed = _price_cart(cart, customer, pos_profile, coupon_code, loyalty_points)
+
+	return {
+		"currency": doc.currency or profile.currency,
+		"net_total": flt(doc.net_total),
+		"total": flt(doc.total),
+		"discount_amount": flt(doc.discount_amount),
+		"grand_total": flt(doc.grand_total),
+		"rounded_total": flt(doc.rounded_total),
+		"amount_due": _amount_due(doc),
+		"coupon": doc.coupon_code or None,
+		"loyalty_points": cint(redeemed),
+		"loyalty_amount": flt(doc.get("loyalty_amount")),
+	}

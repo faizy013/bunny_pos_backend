@@ -180,6 +180,97 @@ class TestCreateInvoice(unittest.TestCase):
 		self.assertEqual(float(row["grand_total"]), 0.0)
 		self.assertFalse(row["fully_returned"])
 
+	def test_a_coupon_takes_money_off(self):
+		from bunny_pos_backend.api.invoices import check_coupon
+
+		code = frappe.db.get_value("Coupon Code", {}, "coupon_code")
+		if not code:
+			raise unittest.SkipTest("no coupon on this site")
+
+		check_coupon(code, pos_profile=self.shift.pos_profile)
+
+		plain = create_invoice(self._cart(), request_id=frappe.generate_hash(length=20))
+		with_coupon = create_invoice(
+			self._cart(), coupon_code=code, request_id=frappe.generate_hash(length=20)
+		)
+		self.assertLess(
+			float(with_coupon["grand_total"]),
+			float(plain["grand_total"]),
+			"the coupon did not discount anything",
+		)
+
+	def test_an_unknown_coupon_is_refused(self):
+		with self.assertRaises(frappe.ValidationError):
+			create_invoice(
+				self._cart(),
+				coupon_code="NO-SUCH-COUPON",
+				request_id=frappe.generate_hash(length=20),
+			)
+
+	def test_points_come_off_the_bill_and_off_the_balance(self):
+		"""Redeeming has to do both, or the shop gives away one of them."""
+		from bunny_pos_backend.api.customers import get_loyalty
+
+		customer = frappe.db.get_value("POS Profile", self.shift.pos_profile, "customer")
+		if not customer:
+			raise unittest.SkipTest("the profile has no default customer")
+		before = get_loyalty(customer, self.shift.pos_profile)
+		if not before.get("enrolled") or before["points"] < 10:
+			raise unittest.SkipTest("customer has no points to spend")
+
+		spend = 10
+		plain = create_invoice(self._cart(), request_id=frappe.generate_hash(length=20))
+		redeemed = create_invoice(
+			self._cart(), loyalty_points=spend, request_id=frappe.generate_hash(length=20)
+		)
+
+		off = float(plain["grand_total"]) - float(redeemed["grand_total"])
+		self.assertAlmostEqual(off, spend * before["conversion_factor"], places=2)
+
+		taken = frappe.get_all(
+			"Loyalty Point Entry",
+			filters={"invoice": redeemed["name"], "loyalty_points": ("<", 0)},
+			pluck="loyalty_points",
+		)
+		self.assertEqual(sum(taken), -spend, "the points were discounted but never taken")
+
+	def test_more_points_than_the_customer_has_is_refused(self):
+		with self.assertRaises(frappe.ValidationError):
+			create_invoice(
+				self._cart(), loyalty_points=10_000_000, request_id=frappe.generate_hash(length=20)
+			)
+
+	def test_a_coupon_and_points_together_are_refused(self):
+		"""Stacking them silently dropped the points' discount but still spent them."""
+		code = frappe.db.get_value("Coupon Code", {}, "coupon_code")
+		if not code:
+			raise unittest.SkipTest("no coupon on this site")
+		with self.assertRaises(frappe.ValidationError):
+			create_invoice(
+				self._cart(),
+				coupon_code=code,
+				loyalty_points=1,
+				request_id=frappe.generate_hash(length=20),
+			)
+
+	def test_the_quoted_total_is_the_billed_total(self):
+		"""The cashier reads the quote out loud, so it has to be the real figure."""
+		from bunny_pos_backend.api.invoices import quote
+
+		code = frappe.db.get_value("Coupon Code", {}, "coupon_code")
+		cases = [{}, {"coupon_code": code} if code else {}]
+		for extra in cases:
+			quoted = quote(self._cart(), pos_profile=self.shift.pos_profile, **extra)
+			billed = create_invoice(
+				self._cart(), request_id=frappe.generate_hash(length=20), **extra
+			)
+			self.assertAlmostEqual(
+				float(quoted["grand_total"]),
+				float(billed["grand_total"]),
+				places=2,
+				msg=f"quote and bill disagree for {extra}",
+			)
+
 	def test_unknown_item_is_refused(self):
 		with self.assertRaises(frappe.ValidationError):
 			create_invoice([{"item_code": "no-such-item-at-all", "qty": 1}])

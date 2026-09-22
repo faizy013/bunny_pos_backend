@@ -9,7 +9,7 @@ a sale without leaving the POS. Standard Customer records only.
 
 import frappe
 from frappe import _
-from frappe.utils import cint
+from frappe.utils import cint, flt
 
 from bunny_pos_backend.api.utils import get_pos_profile, pos_api
 
@@ -112,4 +112,47 @@ def create_customer(pos_profile, customer_name, mobile_no=None, email_id=None):
 		"mobile_no": doc.mobile_no,
 		"email_id": doc.email_id,
 		"default_currency": doc.default_currency,
+	}
+
+
+@frappe.whitelist()
+@pos_api
+def get_loyalty(customer, pos_profile=None):
+	"""What this customer can pay with in points.
+
+	ERPNext already works out the balance, expiry and tier, so this only puts
+	its answer in the shape the till needs: how many points there are and what
+	they are worth in money.
+	"""
+	from erpnext.accounts.doctype.loyalty_program.loyalty_program import (
+		get_loyalty_program_details_with_points,
+	)
+
+	profile = get_pos_profile(pos_profile)
+
+	if not customer or not frappe.db.exists("Customer", customer):
+		frappe.throw(_("Bunny POS: customer {0} does not exist.").format(customer))
+
+	program = frappe.db.get_value("Customer", customer, "loyalty_program")
+	if not program:
+		return {"enrolled": False, "points": 0, "conversion_factor": 0, "value": 0, "program": None}
+
+	details = (
+		get_loyalty_program_details_with_points(
+			customer, company=profile.company, loyalty_program=program, silent=True
+		)
+		or {}
+	)
+
+	points = cint(details.get("loyalty_points"))
+	factor = flt(details.get("conversion_factor"))
+	return {
+		"enrolled": True,
+		"program": program,
+		"tier": details.get("tier_name"),
+		"points": points,
+		"conversion_factor": factor,
+		# What the whole balance is worth, so the till can show it in money.
+		"value": flt(points * factor, 2),
+		"currency": profile.currency,
 	}
