@@ -85,6 +85,12 @@ hr "create_invoice"
 CART="[{\"item_code\":\"${ITEM_1}\",\"qty\":1}"
 if [ -n "$ITEM_2" ]; then CART="${CART},{\"item_code\":\"${ITEM_2}\",\"qty\":2}"; fi
 CART="${CART}]"
-curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
-  -d "{\"cart_data\":${CART},\"payments\":[{\"mode_of_payment\":\"Cash\"}]}" \
+REQ_ID="smoke-$(date +%s)-$$"
+BODY="{\"cart_data\":${CART},\"payments\":[{\"mode_of_payment\":\"Cash\"}],\"request_id\":\"${REQ_ID}\"}"
+curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" -d "$BODY" \
   "${API}.invoices.create_invoice"; echo
+
+hr "create_invoice again with the same request_id (must not bill twice)"
+curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" -d "$BODY" \
+  "${API}.invoices.create_invoice"; echo
+echo "^ both calls must report the same invoice name"

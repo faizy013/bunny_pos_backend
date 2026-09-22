@@ -17,21 +17,47 @@ from bunny_pos_backend.api.utils import get_pos_profile, parse_json, pos_api
 
 @frappe.whitelist(methods=["POST"])
 @pos_api
-def create_invoice(cart_data, customer=None, payments=None, pos_profile=None):
+def create_invoice(cart_data, customer=None, payments=None, pos_profile=None, request_id=None):
 	"""Create and submit a POS Invoice for the caller's open shift.
 
-	``cart_data`` is a list of ``{"item_code": ..., "qty": ...}`` rows. Any rate
-	sent by the client is ignored on purpose -- the price list decides the rate
-	server-side.
+	``cart_data`` is a list of ``{"item_code": ..., "qty": ...}`` rows. A row may
+	also carry a rate or a discount, but only a POS Profile that allows those
+	changes will accept them; otherwise the price list decides, server-side.
 
 	``payments`` may be omitted (the whole invoice goes to the profile's default
 	mode of payment), a mapping of mode to amount, or a list of
 	``{"mode_of_payment": ..., "amount": ...}`` rows.
+
+	``request_id`` makes the call idempotent. A till that loses the reply to a
+	successful sale will retry it, and without this that retry bills the
+	customer a second time. Send the same id for every retry of one sale and a
+	new one for the next sale; the first call wins and the rest get the invoice
+	it made.
 	"""
 	cart = parse_json(cart_data, "cart_data", (list,))
 	if not cart:
 		frappe.throw(_("Bunny POS: the cart is empty."))
 
+	request_id = (str(request_id or "").strip() or None)
+	if request_id:
+		settled = _settled_invoice(request_id)
+		if settled:
+			return _invoice_response(frappe.get_doc("POS Invoice", settled))
+		_claim_request(request_id)
+
+	try:
+		doc = _build_and_submit(cart, customer, pos_profile, payments, request_id)
+	except Exception:
+		# The sale did not happen, so the till must be free to try again with
+		# the same id rather than being told its own retry is a duplicate.
+		if request_id:
+			frappe.cache().delete(_request_key(request_id))
+		raise
+
+	return _invoice_response(doc)
+
+
+def _build_and_submit(cart, customer, pos_profile, payments, request_id):
 	profile = _resolve_profile(pos_profile)
 
 	customer = customer or profile.customer
@@ -80,7 +106,76 @@ def create_invoice(cart_data, customer=None, payments=None, pos_profile=None):
 
 	doc.submit()
 
-	return _invoice_response(doc)
+	if request_id:
+		_mark_settled(doc, request_id)
+
+	return doc
+
+
+REQUEST_PREFIX = "bunny-pos:request:"
+REQUEST_TTL_SECONDS = 30 * 60
+REMARK_TAG = "Bunny POS request:"
+
+
+def _request_key(request_id):
+	"""Raw Redis key, site-scoped by hand.
+
+	The raw redis methods are used throughout rather than frappe's set_value /
+	get_value helpers: those namespace the key themselves, and only the raw
+	call takes the NX flag this needs. Mixing the two would read a different
+	key than it wrote.
+	"""
+	return f"{REQUEST_PREFIX}{frappe.local.site}:{request_id}"
+
+
+def _claim_request(request_id):
+	"""Let exactly one caller through for a given request id.
+
+	SET NX is atomic, so two tills -- or one till retrying while the first
+	attempt is still running -- cannot both pass this point.
+	"""
+	won = frappe.cache().set(_request_key(request_id), b"working", nx=True, ex=REQUEST_TTL_SECONDS)
+	if not won:
+		frappe.throw(
+			_("Bunny POS: this sale is already being billed. Wait a moment and check the sale list."),
+			title=_("Duplicate request"),
+		)
+
+
+def _mark_settled(doc, request_id):
+	"""Record the id on the invoice itself so the guard outlives Redis.
+
+	``remarks`` is a standard POS Invoice field that nothing else here writes,
+	which keeps this working on a stock ERPNext with no customisation.
+	"""
+	tag = f"{REMARK_TAG} {request_id}"
+	remarks = (doc.remarks or "").strip()
+	doc.db_set("remarks", f"{remarks}\n{tag}".strip() if remarks else tag, update_modified=False)
+	frappe.cache().set(_request_key(request_id), doc.name, ex=REQUEST_TTL_SECONDS)
+
+
+def _settled_invoice(request_id):
+	"""The invoice already raised for this id, or None."""
+	cached = frappe.cache().get(_request_key(request_id))
+	if isinstance(cached, bytes):
+		cached = cached.decode()
+	if cached and cached != "working":
+		return cached
+
+	# Redis can be restarted between the sale and the retry, so fall back to
+	# the invoice. Scoped to this cashier's recent sales to keep it cheap.
+	rows = frappe.get_all(
+		"POS Invoice",
+		filters={
+			"owner": frappe.session.user,
+			"docstatus": 1,
+			"creation": (">", frappe.utils.add_to_date(None, hours=-24)),
+			"remarks": ("like", f"%{REMARK_TAG} {request_id}%"),
+		},
+		pluck="name",
+		limit=1,
+	)
+	return rows[0] if rows else None
 
 
 def _resolve_profile(pos_profile):
