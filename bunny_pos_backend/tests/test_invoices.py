@@ -152,6 +152,34 @@ class TestCreateInvoice(unittest.TestCase):
 			profile.db_set("allow_rate_change", was)
 			frappe.clear_document_cache("POS Profile", profile.name)
 
+	def test_a_zero_value_sale_is_not_reported_as_returned(self):
+		"""Everything discounted away is still a sale with goods to bring back.
+
+		fully_returned used to be judged on money: nothing left to refund read
+		as already refunded, and the cashier could not take the item back.
+		"""
+		from bunny_pos_backend.api.invoices import search_invoices
+
+		profile = frappe.get_doc("POS Profile", self.shift.pos_profile)
+		was = profile.allow_discount_change
+		try:
+			profile.db_set("allow_discount_change", 1)
+			frappe.clear_document_cache("POS Profile", profile.name)
+			created = create_invoice(
+				[{"item_code": self.item["item_code"], "qty": 1, "discount_percentage": 100}],
+				request_id=frappe.generate_hash(length=20),
+			)
+		finally:
+			profile.db_set("allow_discount_change", was)
+			frappe.clear_document_cache("POS Profile", profile.name)
+
+		row = next(
+			(r for r in search_invoices(limit=100) if r["name"] == created["name"]), None
+		)
+		self.assertIsNotNone(row, "the sale should be offered for return")
+		self.assertEqual(float(row["grand_total"]), 0.0)
+		self.assertFalse(row["fully_returned"])
+
 	def test_unknown_item_is_refused(self):
 		with self.assertRaises(frappe.ValidationError):
 			create_invoice([{"item_code": "no-such-item-at-all", "qty": 1}])

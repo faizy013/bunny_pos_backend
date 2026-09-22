@@ -518,7 +518,20 @@ def search_invoices(pos_profile=None, search_term=None, limit=20):
 				where r.return_against = pinv.name
 					and r.docstatus = 1
 					and r.is_return = 1
-			), 0) as returned_total
+			), 0) as returned_total,
+			ifnull((
+				select sum(pi.qty)
+				from `tabPOS Invoice Item` pi
+				where pi.parent = pinv.name
+			), 0) as sold_qty,
+			ifnull((
+				select sum(ri.qty)
+				from `tabPOS Invoice Item` ri
+				inner join `tabPOS Invoice` r on r.name = ri.parent
+				where r.return_against = pinv.name
+					and r.docstatus = 1
+					and r.is_return = 1
+			), 0) as returned_qty
 		from `tabPOS Invoice` pinv
 		where {conditions}
 		order by pinv.creation desc
@@ -534,8 +547,18 @@ def search_invoices(pos_profile=None, search_term=None, limit=20):
 		total = flt(row.rounded_total) or flt(row.grand_total)
 		row["returned_amount"] = abs(flt(row.returned_total))
 		row["refundable_amount"] = max(0.0, flt(total) + flt(row.returned_total))
-		row["fully_returned"] = row["refundable_amount"] <= 0
+
+		# Judged on quantity, not money. A sale that came to zero -- everything
+		# discounted, or a giveaway -- has nothing left to refund by value, and
+		# reading that as "fully returned" locked the cashier out of returning
+		# goods that were never brought back.
+		sold = flt(row.sold_qty)
+		returned = abs(flt(row.returned_qty))
+		row["fully_returned"] = sold > 0 and returned >= sold
+
 		row.pop("returned_total", None)
+		row.pop("sold_qty", None)
+		row.pop("returned_qty", None)
 
 	return rows
 
