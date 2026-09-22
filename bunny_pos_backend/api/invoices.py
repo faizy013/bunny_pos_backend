@@ -317,10 +317,15 @@ def _apply_line_overrides(doc, rows, profile):
 				item.discount_amount = flt(
 					price_list_rate - item.rate, item.precision("discount_amount")
 				)
-				item.discount_percentage = flt(
-					item.discount_amount / price_list_rate * 100.0,
-					item.precision("discount_percentage"),
-				)
+				precision = item.precision("discount_percentage")
+				percentage = flt(item.discount_amount / price_list_rate * 100.0, precision)
+				# ERPNext reads a discount of exactly 100% as "free" and forces the
+				# rate to zero. A rate just above zero rounds up to 100 here, so a
+				# cashier keying 0.01 would hand the item over for nothing. Hold it
+				# just under instead, and keep discount_amount as the true figure.
+				if percentage >= 100 and item.rate > 0:
+					percentage = flt(100 - 10**-precision, precision)
+				item.discount_percentage = percentage
 
 
 def _parse_payments(payments):

@@ -130,6 +130,28 @@ class TestCreateInvoice(unittest.TestCase):
 			profile.db_set("allow_rate_change", was)
 			frappe.clear_document_cache("POS Profile", profile.name)
 
+	def test_a_rate_just_above_zero_is_not_given_away(self):
+		"""A near-zero rate rounds to a 100% discount, which ERPNext reads as free.
+
+		Without the clamp the customer walks out with the item for nothing.
+		"""
+		profile = frappe.get_doc("POS Profile", self.shift.pos_profile)
+		was = profile.allow_rate_change
+		try:
+			profile.db_set("allow_rate_change", 1)
+			frappe.clear_document_cache("POS Profile", profile.name)
+			for asked in (0.01, 0.5, 1):
+				result = create_invoice(
+					[{"item_code": self.item["item_code"], "qty": 1, "rate": asked}],
+					request_id=frappe.generate_hash(length=20),
+				)
+				doc = frappe.get_doc("POS Invoice", result["name"])
+				self.assertEqual(float(doc.items[0].rate), float(asked))
+				self.assertGreater(float(doc.grand_total), 0)
+		finally:
+			profile.db_set("allow_rate_change", was)
+			frappe.clear_document_cache("POS Profile", profile.name)
+
 	def test_unknown_item_is_refused(self):
 		with self.assertRaises(frappe.ValidationError):
 			create_invoice([{"item_code": "no-such-item-at-all", "qty": 1}])
