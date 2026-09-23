@@ -26,6 +26,7 @@ def all(verbosity: int = 2):
 			"bunny_pos_backend.tests.test_invoices",
 			"bunny_pos_backend.tests.test_restaurant",
 			"bunny_pos_backend.tests.test_scale",
+			"bunny_pos_backend.tests.test_shift_close",
 		]
 	)
 	result = unittest.TextTestRunner(verbosity=verbosity).run(suite)

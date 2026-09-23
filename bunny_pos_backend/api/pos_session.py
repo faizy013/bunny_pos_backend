@@ -5,7 +5,7 @@
 
 import frappe
 from frappe import _
-from frappe.utils import flt, now_datetime, nowdate
+from frappe.utils import cint, flt, now_datetime, nowdate
 
 from bunny_pos_backend.api.utils import (
 	get_payment_modes,
@@ -92,28 +92,79 @@ def get_shift_summary():
 	figures a cashier counts against are the ones ERPNext will reconcile.
 	"""
 	shift = _current_shift()
+	end = frappe.utils.get_datetime()
 
-	entry = _build_closing_entry(shift)
+	totals, payments = _shift_takings(shift, end)
+
+	expected = {}
+	for row in shift.balance_details:
+		expected[row.mode_of_payment] = {
+			"mode_of_payment": row.mode_of_payment,
+			"opening_amount": flt(row.opening_amount),
+			"expected_amount": flt(row.opening_amount),
+		}
+	for mode, amount in payments.items():
+		if mode in expected:
+			expected[mode]["expected_amount"] += flt(amount)
+		else:
+			expected[mode] = {
+				"mode_of_payment": mode,
+				"opening_amount": 0.0,
+				"expected_amount": flt(amount),
+			}
 
 	return {
 		"shift": shift.name,
-		"pos_profile": entry.pos_profile,
-		"period_start_date": str(entry.period_start_date),
-		"period_end_date": str(entry.period_end_date),
-		"currency": frappe.get_cached_value("POS Profile", entry.pos_profile, "currency"),
-		"invoice_count": len(entry.pos_transactions),
-		"total_quantity": flt(entry.total_quantity),
-		"net_total": flt(entry.net_total),
-		"grand_total": flt(entry.grand_total),
-		"payments": [
-			{
-				"mode_of_payment": row.mode_of_payment,
-				"opening_amount": flt(row.opening_amount),
-				"expected_amount": flt(row.expected_amount),
-			}
-			for row in entry.payment_reconciliation
-		],
+		"pos_profile": shift.pos_profile,
+		"period_start_date": str(shift.period_start_date),
+		"period_end_date": str(end),
+		"currency": frappe.get_cached_value("POS Profile", shift.pos_profile, "currency"),
+		"invoice_count": cint(totals.get("invoices")),
+		"total_quantity": flt(totals.get("total_qty")),
+		"net_total": flt(totals.get("net_total")),
+		"grand_total": flt(totals.get("grand_total")),
+		"payments": list(expected.values()),
 	}
+
+
+def _shift_takings(shift, end):
+	"""Add up the shift without loading a single invoice.
+
+	ERPNext's own closing-entry builder reads every invoice as a full document
+	to reach its taxes and payments. That is what the submitted entry needs, so
+	closing still goes through it -- but a cashier opening the close screen
+	waits seconds for figures three sums can answer, and on a busy day that is
+	the difference between a queue moving and not.
+	"""
+	window, where = _shift_window(shift, end)
+
+	totals = frappe.db.sql(
+		f"""
+		select
+			count(*) as invoices,
+			ifnull(sum(pinv.grand_total), 0) as grand_total,
+			ifnull(sum(pinv.net_total), 0) as net_total,
+			ifnull(sum(pinv.total_qty), 0) as total_qty
+		from `tabPOS Invoice` pinv
+		where {where}
+		""",
+		window,
+		as_dict=True,
+	)[0]
+
+	rows = frappe.db.sql(
+		f"""
+		select pay.mode_of_payment, ifnull(sum(pay.amount), 0) as amount
+		from `tabSales Invoice Payment` pay
+		inner join `tabPOS Invoice` pinv on pinv.name = pay.parent
+		where {where} and pay.parenttype = 'POS Invoice'
+		group by pay.mode_of_payment
+		""",
+		window,
+		as_dict=True,
+	)
+
+	return totals, {row.mode_of_payment: row.amount for row in rows}
 
 
 @frappe.whitelist(methods=["POST"])
@@ -198,12 +249,109 @@ def _current_shift():
 
 
 def _build_closing_entry(shift):
-	"""Let ERPNext assemble the closing entry from the opening one."""
-	from erpnext.accounts.doctype.pos_closing_entry.pos_closing_entry import (
-		make_closing_entry_from_opening,
+	"""Assemble the closing entry the shift will be submitted as.
+
+	ERPNext's own builder reads every invoice of the shift as a full document
+	to reach its taxes and payments -- three hundred sales is three hundred
+	document loads, and the cashier waits through all of it at the end of a
+	day. The same three tables are gathered here in four queries.
+
+	Every field ERPNext's builder sets is set here, and a test holds the two
+	side by side so this cannot quietly drift from it.
+	"""
+	end = frappe.utils.get_datetime()
+	entry = frappe.new_doc("POS Closing Entry")
+	entry.pos_opening_entry = shift.name
+	entry.period_start_date = shift.period_start_date
+	entry.period_end_date = end
+	entry.pos_profile = shift.pos_profile
+	entry.user = shift.user
+	entry.company = shift.company
+
+	totals, payments = _shift_takings(shift, end)
+	entry.grand_total = flt(totals.get("grand_total"))
+	entry.net_total = flt(totals.get("net_total"))
+	entry.total_quantity = flt(totals.get("total_qty"))
+
+	entry.set("pos_transactions", _shift_invoices(shift, end))
+
+	reconciliation = []
+	seen = {}
+	for detail in shift.balance_details:
+		row = {
+			"mode_of_payment": detail.mode_of_payment,
+			"opening_amount": flt(detail.opening_amount),
+			"expected_amount": flt(detail.opening_amount),
+		}
+		reconciliation.append(row)
+		seen[detail.mode_of_payment] = row
+	for mode, amount in payments.items():
+		if mode in seen:
+			seen[mode]["expected_amount"] += flt(amount)
+		else:
+			reconciliation.append(
+				{"mode_of_payment": mode, "opening_amount": 0, "expected_amount": flt(amount)}
+			)
+	entry.set("payment_reconciliation", reconciliation)
+
+	entry.set("taxes", _shift_taxes(shift, end))
+	return entry
+
+
+def _shift_window(shift, end):
+	return (
+		{
+			"user": shift.user,
+			"profile": shift.pos_profile,
+			"start": shift.period_start_date,
+			"end": end,
+		},
+		"""
+			pinv.owner = %(user)s
+			and pinv.docstatus = 1
+			and pinv.pos_profile = %(profile)s
+			and ifnull(pinv.consolidated_invoice, '') = ''
+			and timestamp(pinv.posting_date, pinv.posting_time) between %(start)s and %(end)s
+		""",
 	)
 
-	return make_closing_entry_from_opening(shift)
+
+def _shift_invoices(shift, end):
+	"""One row per sale, in the order they were rung up."""
+	window, where = _shift_window(shift, end)
+	return frappe.db.sql(
+		f"""
+		select
+			pinv.name as pos_invoice,
+			pinv.posting_date,
+			pinv.grand_total,
+			pinv.customer
+		from `tabPOS Invoice` pinv
+		where {where}
+		order by timestamp(pinv.posting_date, pinv.posting_time)
+		""",
+		window,
+		as_dict=True,
+	)
+
+
+def _shift_taxes(shift, end):
+	"""Tax collected over the shift, gathered the way ERPNext groups it."""
+	window, where = _shift_window(shift, end)
+	return frappe.db.sql(
+		f"""
+		select
+			tax.account_head,
+			tax.rate,
+			ifnull(sum(tax.tax_amount), 0) as amount
+		from `tabSales Taxes and Charges` tax
+		inner join `tabPOS Invoice` pinv on pinv.name = tax.parent
+		where {where} and tax.parenttype = 'POS Invoice'
+		group by tax.account_head, tax.rate
+		""",
+		window,
+		as_dict=True,
+	)
 
 
 def _parse_closing_amounts(closing_amounts):
