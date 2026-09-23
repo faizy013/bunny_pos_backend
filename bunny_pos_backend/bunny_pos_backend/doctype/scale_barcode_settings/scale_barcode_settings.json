@@ -1,0 +1,89 @@
+{
+ "actions": [],
+ "creation": "2026-09-23 09:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "enabled",
+  "section_shape",
+  "prefixes",
+  "code_digits",
+  "column_break_shape",
+  "value_digits",
+  "value_is",
+  "weight_uom",
+  "section_help",
+  "help"
+ ],
+ "fields": [
+  {
+   "default": "0",
+   "description": "Turn on only if your scale prints barcode labels.",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Read scale labels"
+  },
+  {"fieldname": "section_shape", "fieldtype": "Section Break", "label": "Label shape"},
+  {
+   "default": "2",
+   "description": "First digits that mark an in-store weighed label, comma separated. Most scales use 2, some use 20 to 29.",
+   "fieldname": "prefixes",
+   "fieldtype": "Data",
+   "label": "Prefixes"
+  },
+  {
+   "default": "5",
+   "description": "How many digits after the prefix hold the item's number.",
+   "fieldname": "code_digits",
+   "fieldtype": "Int",
+   "label": "Item digits"
+  },
+  {"fieldname": "column_break_shape", "fieldtype": "Column Break"},
+  {
+   "default": "5",
+   "description": "How many digits hold the weight or the price.",
+   "fieldname": "value_digits",
+   "fieldtype": "Int",
+   "label": "Value digits"
+  },
+  {
+   "default": "Price",
+   "description": "Whether those digits are money or a weight.",
+   "fieldname": "value_is",
+   "fieldtype": "Select",
+   "label": "Value holds",
+   "options": "Price\nWeight"
+  },
+  {
+   "default": "Kg",
+   "depends_on": "eval:doc.value_is === \"Weight\"",
+   "description": "The unit the weight digits add up to. Grams are converted.",
+   "fieldname": "weight_uom",
+   "fieldtype": "Link",
+   "label": "Weight UOM",
+   "options": "UOM"
+  },
+  {"fieldname": "section_help", "fieldtype": "Section Break"},
+  {
+   "fieldname": "help",
+   "fieldtype": "HTML",
+   "options": "<p>The item's number on the label is matched against <b>Item Barcode</b>, so give each weighed item a barcode row holding the number the scale prints. Leading zeros do not matter.</p><p>Example with prefix 2, 5 item digits, 5 price digits: <code>2&nbsp;01234&nbsp;01250&nbsp;8</code> is item 01234 at 12.50.</p>"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-09-23 09:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Bunny POS Backend",
+ "name": "Scale Barcode Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {"create": 1, "delete": 1, "email": 1, "print": 1, "read": 1, "role": "System Manager", "share": 1, "write": 1},
+  {"create": 1, "delete": 1, "email": 1, "print": 1, "read": 1, "role": "Accounts Manager", "share": 1, "write": 1},
+  {"read": 1, "role": "Accounts User"}
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}

@@ -65,6 +65,94 @@ def get_items(pos_profile, search_term=None, item_group=None, start=0, limit=Non
 	return context
 
 
+def _scale_label(code):
+	"""Read a label a weighing scale printed, or return None.
+
+	These carry the item's own number and either what it weighed or what it
+	came to, so the till can put the right quantity on the line instead of
+	asking the cashier to key it. The shape differs by scale, which is why it
+	is configured rather than guessed.
+	"""
+	settings = frappe.get_cached_doc("Scale Barcode Settings")
+	if not cint(settings.enabled) or not code.isdigit():
+		return None
+
+	prefixes = [p.strip() for p in (settings.prefixes or "").split(",") if p.strip()]
+	prefix = next((p for p in sorted(prefixes, key=len, reverse=True) if code.startswith(p)), None)
+	if not prefix:
+		return None
+
+	digits = cint(settings.code_digits)
+	values = cint(settings.value_digits)
+	if len(code) < len(prefix) + digits + values:
+		return None
+
+	at = len(prefix)
+	item_number = code[at : at + digits]
+	raw = code[at + digits : at + digits + values]
+	if not raw.isdigit():
+		return None
+
+	return {
+		"item_number": item_number,
+		# Scales count in whole small units: paise for money, grams for weight.
+		"units": cint(raw),
+		"is_price": settings.value_is != "Weight",
+		"weight_uom": settings.weight_uom or "Kg",
+	}
+
+
+def _scale_qty(item, label):
+	"""How much of the item the label stands for.
+
+	A label that carries a weight says so outright. One that carries a price
+	says what it came to, and the quantity is whatever that buys at the
+	shelf price -- which is how the line still adds up to the printed figure.
+	"""
+	if not label["is_price"]:
+		grams = flt(label["units"])
+		if (label["weight_uom"] or "").lower() in ("gram", "g", "grams"):
+			return grams
+		return flt(grams / 1000.0, 3)
+
+	price = flt(label["units"]) / 100.0
+	rate = flt(item.rate)
+	if rate <= 0:
+		frappe.throw(
+			_("Bunny POS: {0} has no price, so a label worth {1} cannot be weighed out.").format(
+				item.item_code, price
+			)
+		)
+	return flt(price / rate, 3)
+
+
+def _item_for_number(number):
+	"""The item whose barcode is the number the scale printed.
+
+	Leading zeros are ignored on both sides. A shop writes 1234 against the
+	item, and how many zeros the scale pads it with depends on how many digits
+	the label was set up for -- neither should have to match the other.
+	"""
+	exact = frappe.db.get_value("Item Barcode", {"barcode": number}, "parent")
+	if exact:
+		return exact
+
+	trimmed = number.lstrip("0")
+	if not trimmed:
+		return None
+
+	rows = frappe.db.sql(
+		"""
+		select parent
+		from `tabItem Barcode`
+		where barcode regexp '^[0-9]+$' and cast(barcode as unsigned) = %(value)s
+		limit 1
+		""",
+		{"value": int(trimmed)},
+	)
+	return rows[0][0] if rows else None
+
+
 @frappe.whitelist()
 @pos_api
 def scan(pos_profile, code):
@@ -82,8 +170,22 @@ def scan(pos_profile, code):
 	if not code:
 		frappe.throw(_("Bunny POS: nothing was scanned."))
 
-	found = scan_barcode(code) or {}
-	item_code = found.get("item_code")
+	label = _scale_label(code)
+	found = {}
+	item_code = None
+
+	if label:
+		item_code = _item_for_number(label["item_number"])
+		if not item_code:
+			frappe.throw(
+				_("Bunny POS: the scale label is for item {0}, which nothing here answers to.").format(
+					label["item_number"]
+				)
+			)
+	else:
+		found = scan_barcode(code) or {}
+		item_code = found.get("item_code")
+
 	if not item_code:
 		frappe.throw(_("Bunny POS: nothing matches {0}.").format(code))
 
@@ -111,9 +213,17 @@ def scan(pos_profile, code):
 	if scanned_uom and any(u["uom"] == scanned_uom for u in item.uoms):
 		item.uom = scanned_uom
 
+	qty = 1.0
+	if label:
+		qty = _scale_qty(item, label)
+
 	return {
 		"item": item,
 		"uom": item.uom,
+		# How many of that unit the label says, so a weighed item does not
+		# arrive as "1" and have to be keyed in again.
+		"qty": qty,
+		"weighed": bool(label),
 		"barcode": found.get("barcode") or "",
 		"serial_no": found.get("serial_no") or "",
 		"batch_no": found.get("batch_no") or "",
