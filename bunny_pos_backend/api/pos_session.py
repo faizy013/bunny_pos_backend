@@ -213,14 +213,31 @@ def close_shift(closing_amounts=None):
 		)
 		row.difference = flt(row.closing_amount) - expected
 
-	entry.insert()
+	# Two taps on Close shift used to start two closes. One won and the other
+	# left a draft behind that could never be submitted, because by then the
+	# shift was shut -- junk in the shop's books that nobody would explain.
+	_claim_close(shift.name)
 
-	# ERPNext consolidates invoices during submit, and that path writes a
-	# comment linked back to this entry. The link only resolves once the row
-	# is committed, so commit before submitting rather than inside it.
-	frappe.db.commit()
+	try:
+		entry.insert()
 
-	entry.submit()
+		# ERPNext consolidates invoices during submit, and that path writes a
+		# comment linked back to this entry. The link only resolves once the
+		# row is committed, so commit before submitting rather than inside it.
+		frappe.db.commit()
+
+		entry.submit()
+	except Exception:
+		_release_close(shift.name)
+		# The commit above means a failed submit would otherwise leave the
+		# draft sitting there for good.
+		if entry.get("name") and entry.docstatus == 0:
+			frappe.db.rollback()
+			frappe.delete_doc(
+				"POS Closing Entry", entry.name, ignore_permissions=True, force=True
+			)
+			frappe.db.commit()
+		raise
 
 	return {
 		"name": entry.name,
@@ -244,6 +261,33 @@ def close_shift(closing_amounts=None):
 			for row in entry.payment_reconciliation
 		],
 	}
+
+
+CLOSE_PREFIX = "bunny-pos:closing:"
+CLOSE_TTL_SECONDS = 10 * 60
+
+
+def _close_key(shift_name):
+	return f"{CLOSE_PREFIX}{frappe.local.site}:{shift_name}"
+
+
+def _claim_close(shift_name):
+	"""Let one close of a shift run at a time.
+
+	SET NX is atomic, so a second tap cannot slip past while the first is
+	still consolidating the day's invoices -- which takes long enough for an
+	impatient cashier to try again.
+	"""
+	won = frappe.cache().set(_close_key(shift_name), b"closing", nx=True, ex=CLOSE_TTL_SECONDS)
+	if not won:
+		frappe.throw(
+			_("Bunny POS: this shift is already being closed. Give it a moment."),
+			title=_("Already closing"),
+		)
+
+
+def _release_close(shift_name):
+	frappe.cache().delete(_close_key(shift_name))
 
 
 def _current_shift():
