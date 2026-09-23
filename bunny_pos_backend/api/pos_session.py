@@ -152,9 +152,22 @@ def _shift_takings(shift, end):
 		as_dict=True,
 	)[0]
 
+	# Change handed back comes out of the drawer it was given from, so it is
+	# taken off that mode. ERPNext's own closing screen does this and its
+	# Python builder does not -- follow the one a shopkeeper actually sees,
+	# because a till that counted 360,000 should not be told it is 850,000
+	# short.
 	rows = frappe.db.sql(
 		f"""
-		select pay.mode_of_payment, ifnull(sum(pay.amount), 0) as amount
+		select
+			pay.mode_of_payment,
+			ifnull(sum(
+				pay.amount - case
+					when pay.account = pinv.account_for_change_amount
+					then ifnull(pinv.change_amount, 0)
+					else 0
+				end
+			), 0) as amount
 		from `tabSales Invoice Payment` pay
 		inner join `tabPOS Invoice` pinv on pinv.name = pay.parent
 		where {where} and pay.parenttype = 'POS Invoice'
